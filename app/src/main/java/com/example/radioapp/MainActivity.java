@@ -84,6 +84,15 @@ public class MainActivity extends Activity {
         } else {
             registerReceiver(stateReceiver, filter);
         }
+
+        // 打开 App 即让通知栏出现控制按钮(上一台/播放暂停/下一台)
+        Intent init = new Intent(this, RadioService.class);
+        init.setAction(RadioService.ACTION_INIT);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(init);
+        } else {
+            startService(init);
+        }
     }
 
     @Override

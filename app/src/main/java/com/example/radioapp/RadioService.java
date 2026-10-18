@@ -39,6 +39,7 @@ public class RadioService extends Service
     public static final String ACTION_NEXT = "com.example.radioapp.action.NEXT";
     public static final String ACTION_PREV = "com.example.radioapp.action.PREV";
     public static final String ACTION_STOP = "com.example.radioapp.action.STOP";
+    public static final String ACTION_INIT = "com.example.radioapp.action.INIT";
     public static final String ACTION_REQUEST_STATE = "com.example.radioapp.action.REQUEST_STATE";
     public static final String ACTION_STATE = "com.example.radioapp.action.STATE";
     public static final String EXTRA_INDEX = "extra_index";
@@ -96,6 +97,9 @@ public class RadioService extends Service
             previous();
         } else if (ACTION_STOP.equals(action)) {
             stop();
+        } else if (ACTION_INIT.equals(action)) {
+            // 打开 App 时让通知栏立刻出现控制按钮(即使还没选台)
+            updateNotification();
         } else if (ACTION_REQUEST_STATE.equals(action)) {
             broadcastState();
         }
@@ -244,7 +248,6 @@ public class RadioService extends Service
     }
 
     private void updateNotification() {
-        if (currentIndex < 0) return;
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel ch = new NotificationChannel(
@@ -252,6 +255,11 @@ public class RadioService extends Service
             ch.setDescription("网络电台播放通知");
             nm.createNotificationChannel(ch);
         }
+
+        String title = currentIndex >= 0 ? Stations.list.get(currentIndex).name : "网络电台";
+        String text = currentIndex >= 0
+                ? (isBuffering ? "缓冲中…" : "正在播放")
+                : "点击播放开始收听";
 
         Intent openIntent = new Intent(this, MainActivity.class);
         openIntent.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
@@ -271,12 +279,15 @@ public class RadioService extends Service
             builder = new Notification.Builder(this);
         }
         builder.setSmallIcon(R.drawable.ic_radio)
-                .setContentTitle(Stations.list.get(currentIndex).name)
-                .setContentText(isBuffering ? "缓冲中…" : "网络电台")
+                .setContentTitle(title)
+                .setContentText(text)
                 .setContentIntent(contentIntent)
                 .setStyle(style)
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
                 .setOngoing(true)
+                .setShowWhen(false)
+                .setOnlyAlertOnce(true)
+                .setColor(0xFF6C5CE7)
                 .addAction(R.drawable.ic_prev, "上一台", prevPi)
                 .addAction(isPlaying ? R.drawable.ic_pause : R.drawable.ic_play,
                         isPlaying ? "暂停" : "播放", togglePi)
