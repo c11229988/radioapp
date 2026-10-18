@@ -7,6 +7,7 @@ import android.content.IntentFilter;
 import android.graphics.drawable.Icon;
 import android.os.Build;
 import android.service.quicksettings.Tile;
+import android.service.quicksettings.TileService;
 
 /**
  * 下拉磁贴: 播放 / 暂停 (二合一)
