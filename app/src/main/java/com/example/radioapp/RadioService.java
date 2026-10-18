@@ -13,7 +13,9 @@ import android.media.MediaPlayer;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.util.Log;
 
@@ -29,7 +31,8 @@ import java.util.List;
  *   PLAY / TOGGLE / NEXT / PREV / STOP / REQUEST_STATE
  */
 public class RadioService extends Service
-        implements MediaPlayer.OnPreparedListener, MediaPlayer.OnErrorListener {
+        implements MediaPlayer.OnPreparedListener, MediaPlayer.OnErrorListener,
+                MediaPlayer.OnInfoListener, MediaPlayer.OnBufferingUpdateListener {
 
     public static final String ACTION_PLAY = "com.example.radioapp.action.PLAY";
     public static final String ACTION_TOGGLE = "com.example.radioapp.action.TOGGLE";
@@ -49,6 +52,9 @@ public class RadioService extends Service
     private MediaSession mediaSession;
     private int currentIndex = -1;
     private boolean isPlaying = false;
+    private boolean isBuffering = false;
+    private int retryCount = 0;
+    private static final int MAX_RETRY = 4;
 
     private final MediaSession.Callback sessionCallback = new MediaSession.Callback() {
         @Override
@@ -107,10 +113,14 @@ public class RadioService extends Service
             player.setAudioAttributes(attrs);
             player.setOnPreparedListener(this);
             player.setOnErrorListener(this);
+            player.setOnInfoListener(this);
+            player.setOnBufferingUpdateListener(this);
         }
     }
 
     private void play(int index) {
+        retryCount = 0;
+        isBuffering = false;
         List<Station> list = Stations.list;
         if (list.isEmpty()) return;
         int idx = Math.max(0, Math.min(index, list.size() - 1));
@@ -130,8 +140,10 @@ public class RadioService extends Service
 
     @Override
     public void onPrepared(MediaPlayer mp) {
+        retryCount = 0;
         mp.start();
         isPlaying = true;
+        isBuffering = false;
         updatePlaybackState(PlaybackState.STATE_PLAYING);
         updateNotification();
         broadcastState();
@@ -141,10 +153,43 @@ public class RadioService extends Service
     public boolean onError(MediaPlayer mp, int what, int extra) {
         Log.e("RadioService", "MediaPlayer error what=" + what + " extra=" + extra);
         isPlaying = false;
+        isBuffering = false;
         updatePlaybackState(PlaybackState.STATE_ERROR);
         updateNotification();
         broadcastState();
+        // 网络抖动导致断流: 自动重连当前电台(限制次数, 避免死循环)
+        if (currentIndex >= 0 && retryCount < MAX_RETRY) {
+            retryCount++;
+            Log.e("RadioService", "网络抖动, 自动重连第 " + retryCount + " 次");
+            final int idx = currentIndex;
+            new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (currentIndex == idx) play(idx);
+                }
+            }, 1500);
+        }
         return true;
+    }
+
+    @Override
+    public boolean onInfo(MediaPlayer mp, int what, int extra) {
+        // 直播流网络波动时 MediaPlayer 会进入缓冲: 提示用户而非表现为"卡死"
+        if (what == MediaPlayer.MEDIA_INFO_BUFFERING_START) {
+            isBuffering = true;
+            updatePlaybackState(PlaybackState.STATE_BUFFERING);
+            updateNotification();
+        } else if (what == MediaPlayer.MEDIA_INFO_BUFFERING_END) {
+            isBuffering = false;
+            updatePlaybackState(PlaybackState.STATE_PLAYING);
+            updateNotification();
+        }
+        return false;
+    }
+
+    @Override
+    public void onBufferingUpdate(MediaPlayer mp, int percent) {
+        // 预留: 可用于显示缓冲进度
     }
 
     private void toggle() {
@@ -227,7 +272,7 @@ public class RadioService extends Service
         }
         builder.setSmallIcon(R.drawable.ic_radio)
                 .setContentTitle(Stations.list.get(currentIndex).name)
-                .setContentText("网络电台")
+                .setContentText(isBuffering ? "缓冲中…" : "网络电台")
                 .setContentIntent(contentIntent)
                 .setStyle(style)
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
