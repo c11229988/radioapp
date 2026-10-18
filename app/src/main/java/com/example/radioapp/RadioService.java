@@ -106,21 +106,16 @@ public class RadioService extends Service
         // 兜底: 部分国产 ROM 在别的媒体停止后不会回调 AUDIOFOCUS_GAIN,
         // 这里直接监听系统里是否还有其它媒体在播, 没有了就自动续播(API 29+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            final int myUid = getApplicationInfo().uid;
             playbackCallback = new AudioManager.AudioPlaybackCallback() {
                 @Override
                 public void onPlaybackConfigChanged(List<AudioPlaybackConfiguration> configs) {
                     if (!pausedByFocusLoss || isPlaying) return;
                     boolean otherMediaActive = false;
                     for (AudioPlaybackConfiguration c : configs) {
-                        if (c.getClientUid() == myUid) continue;
-                        if (c.getPlayerState() == AudioPlaybackConfiguration.PLAYER_STATE_STARTED) {
-                            int usage = c.getAudioAttributes().getUsage();
-                            if (usage == AudioAttributes.USAGE_MEDIA
-                                    || usage == AudioAttributes.USAGE_GAME) {
-                                otherMediaActive = true;
-                                break;
-                            }
+                        if (c.isActive()
+                                && c.getAudioAttributes().getUsage() == AudioAttributes.USAGE_MEDIA) {
+                            otherMediaActive = true;
+                            break;
                         }
                     }
                     if (!otherMediaActive) {
