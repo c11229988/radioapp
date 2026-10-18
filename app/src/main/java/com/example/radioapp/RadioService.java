@@ -8,6 +8,8 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioManager;
 import android.media.MediaMetadata;
 import android.media.MediaPlayer;
 import android.media.session.MediaSession;
@@ -52,6 +54,10 @@ public class RadioService extends Service
 
     private MediaPlayer player;
     private MediaSession mediaSession;
+    private AudioManager audioManager;
+    private AudioManager.OnAudioFocusChangeListener audioFocusListener;
+    private Object audioFocusRequest; // AudioFocusRequest (API 26+)
+    private boolean pausedByFocusLoss = false; // 是否因被其他应用抢走声音而暂停
     private int currentIndex = -1;
     private boolean isPlaying = false;
     private boolean isBuffering = false;
@@ -83,6 +89,15 @@ public class RadioService extends Service
                 | MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS);
         mediaSession.setCallback(sessionCallback);
         mediaSession.setActive(true);
+
+        // 音频焦点: 其他应用(音乐/视频/导航)开始时让出声音, 结束后恢复
+        audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+        audioFocusListener = new AudioManager.OnAudioFocusChangeListener() {
+            @Override
+            public void onAudioFocusChange(int focusChange) {
+                handleAudioFocusChange(focusChange);
+            }
+        };
     }
 
     @Override
@@ -126,6 +141,7 @@ public class RadioService extends Service
     private void play(int index) {
         retryCount = 0;
         isBuffering = false;
+        pausedByFocusLoss = false;
         List<Station> list = Stations.list;
         if (list.isEmpty()) return;
         int idx = Math.max(0, Math.min(index, list.size() - 1));
@@ -146,8 +162,10 @@ public class RadioService extends Service
     @Override
     public void onPrepared(MediaPlayer mp) {
         retryCount = 0;
+        requestAudioFocus();
         mp.start();
         isPlaying = true;
+        pausedByFocusLoss = false;
         isBuffering = false;
         updatePlaybackState(PlaybackState.STATE_PLAYING);
         updateNotification();
@@ -205,8 +223,10 @@ public class RadioService extends Service
             isPlaying = false;
             updatePlaybackState(PlaybackState.STATE_PAUSED);
         } else {
+            requestAudioFocus();
             player.start();
             isPlaying = true;
+            pausedByFocusLoss = false;
             updatePlaybackState(PlaybackState.STATE_PLAYING);
         }
         updateNotification();
@@ -224,8 +244,10 @@ public class RadioService extends Service
     }
 
     private void stop() {
+        abandonAudioFocus();
         if (player != null) { player.stop(); player.reset(); }
         isPlaying = false;
+        pausedByFocusLoss = false;
         updatePlaybackState(PlaybackState.STATE_STOPPED);
         stopForeground(true);
         broadcastState();
@@ -246,6 +268,95 @@ public class RadioService extends Service
         m.putString(MediaMetadata.METADATA_KEY_TITLE, name);
         m.putString(MediaMetadata.METADATA_KEY_ARTIST, "网络电台");
         mediaSession.setMetadata(m.build());
+    }
+
+    // ===== 音频焦点管理: 避免与其他音乐/视频/导航应用抢声音 =====
+
+    private void requestAudioFocus() {
+        if (audioManager == null) return;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (audioFocusRequest == null) {
+                AudioAttributes attrs = new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build();
+                audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                        .setAudioAttributes(attrs)
+                        .setOnAudioFocusChangeListener(audioFocusListener)
+                        .build();
+            }
+            audioManager.requestAudioFocus((AudioFocusRequest) audioFocusRequest);
+        } else {
+            audioManager.requestAudioFocus(audioFocusListener,
+                    AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
+        }
+    }
+
+    private void abandonAudioFocus() {
+        if (audioManager == null) return;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (audioFocusRequest != null) {
+                audioManager.abandonAudioFocusRequest((AudioFocusRequest) audioFocusRequest);
+            }
+        } else {
+            audioManager.abandonAudioFocus(audioFocusListener);
+        }
+    }
+
+    private void handleAudioFocusChange(int focusChange) {
+        switch (focusChange) {
+            case AudioManager.AUDIOFOCUS_LOSS:
+                // 被其他应用长期占用(如音乐 App 开始播放): 暂停, 等对方停止后自动恢复
+                if (isPlaying) {
+                    pauseInternal();
+                }
+                pausedByFocusLoss = true;
+                break;
+            case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
+                // 临时失去(如来电): 暂停, 结束后恢复
+                if (isPlaying) {
+                    pauseInternal();
+                    pausedByFocusLoss = true;
+                }
+                break;
+            case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
+                // 短暂压低音量即可(如导航提示音), 不必暂停
+                if (player != null) player.setVolume(0.15f, 0.15f);
+                break;
+            case AudioManager.AUDIOFOCUS_GAIN:
+                // 重新获得焦点: 恢复正常音量; 若之前因被抢而暂停, 则自动恢复播放
+                if (player != null) player.setVolume(1.0f, 1.0f);
+                if (pausedByFocusLoss && !isPlaying && currentIndex >= 0) {
+                    resumeInternal();
+                }
+                pausedByFocusLoss = false;
+                break;
+        }
+    }
+
+    private void pauseInternal() {
+        if (player != null && player.isPlaying()) {
+            player.pause();
+            isPlaying = false;
+            updatePlaybackState(PlaybackState.STATE_PAUSED);
+            updateNotification();
+            broadcastState();
+        }
+    }
+
+    private void resumeInternal() {
+        if (player != null && currentIndex >= 0) {
+            try {
+                player.start();
+                isPlaying = true;
+                updatePlaybackState(PlaybackState.STATE_PLAYING);
+                updateNotification();
+                broadcastState();
+            } catch (Exception e) {
+                // start 失败(如流已断开)则重新连接当前台
+                play(currentIndex);
+            }
+        }
     }
 
     private void updateNotification() {
@@ -333,6 +444,7 @@ public class RadioService extends Service
 
     @Override
     public void onDestroy() {
+        abandonAudioFocus();
         if (player != null) { player.release(); player = null; }
         if (mediaSession != null) { mediaSession.release(); mediaSession = null; }
         stopForeground(true);
