@@ -252,9 +252,10 @@ public class RadioService extends Service
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel ch = new NotificationChannel(
-                    CHANNEL_ID, "网络电台", NotificationManager.IMPORTANCE_DEFAULT);
+                    CHANNEL_ID, "网络电台", NotificationManager.IMPORTANCE_HIGH);
             ch.setDescription("网络电台播放通知");
             ch.setShowBadge(false);
+            ch.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
             nm.createNotificationChannel(ch);
         }
 
@@ -294,6 +295,7 @@ public class RadioService extends Service
                 .setOngoing(true)
                 .setShowWhen(false)
                 .setOnlyAlertOnce(true)
+                .setCategory(Notification.CATEGORY_TRANSPORT)
                 .setColor(0xFF6C5CE7);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -301,6 +303,7 @@ public class RadioService extends Service
             builder.setCustomBigContentView(views);
         } else {
             builder.setContent(views);
+            builder.setPriority(Notification.PRIORITY_HIGH);
         }
 
         startForeground(NOTIF_ID, builder.build());
