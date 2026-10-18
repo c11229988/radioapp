@@ -10,6 +10,7 @@ import android.content.Intent;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
+import android.media.AudioPlaybackConfiguration;
 import android.media.MediaMetadata;
 import android.media.MediaPlayer;
 import android.media.session.MediaSession;
@@ -56,7 +57,9 @@ public class RadioService extends Service
     private MediaSession mediaSession;
     private AudioManager audioManager;
     private AudioManager.OnAudioFocusChangeListener audioFocusListener;
+    private AudioManager.AudioPlaybackCallback playbackCallback;
     private Object audioFocusRequest; // AudioFocusRequest (API 26+)
+    private Handler mainHandler;
     private boolean pausedByFocusLoss = false; // 是否因被其他应用抢走声音而暂停
     private int currentIndex = -1;
     private boolean isPlaying = false;
@@ -92,12 +95,45 @@ public class RadioService extends Service
 
         // 音频焦点: 其他应用(音乐/视频/导航)开始时让出声音, 结束后恢复
         audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+        mainHandler = new Handler(Looper.getMainLooper());
         audioFocusListener = new AudioManager.OnAudioFocusChangeListener() {
             @Override
             public void onAudioFocusChange(int focusChange) {
                 handleAudioFocusChange(focusChange);
             }
         };
+
+        // 兜底: 部分国产 ROM 在别的媒体停止后不会回调 AUDIOFOCUS_GAIN,
+        // 这里直接监听系统里是否还有其它媒体在播, 没有了就自动续播(API 29+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            final int myUid = getApplicationInfo().uid;
+            playbackCallback = new AudioManager.AudioPlaybackCallback() {
+                @Override
+                public void onPlaybackConfigChanged(List<AudioPlaybackConfiguration> configs) {
+                    if (!pausedByFocusLoss || isPlaying) return;
+                    boolean otherMediaActive = false;
+                    for (AudioPlaybackConfiguration c : configs) {
+                        if (c.getClientUid() == myUid) continue;
+                        if (c.getPlayerState() == AudioPlaybackConfiguration.PLAYER_STATE_STARTED) {
+                            int usage = c.getAudioAttributes().getUsage();
+                            if (usage == AudioAttributes.USAGE_MEDIA
+                                    || usage == AudioAttributes.USAGE_GAME) {
+                                otherMediaActive = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!otherMediaActive) {
+                        // 其它媒体都停了, 主线程恢复播放
+                        mainHandler.post(new Runnable() {
+                            @Override
+                            public void run() { resumeInternal(); }
+                        });
+                    }
+                }
+            };
+            audioManager.registerAudioPlaybackCallback(playbackCallback, null);
+        }
     }
 
     @Override
@@ -309,8 +345,8 @@ public class RadioService extends Service
                 // 被其他应用长期占用(如音乐 App 开始播放): 暂停, 等对方停止后自动恢复
                 if (isPlaying) {
                     pauseInternal();
+                    pausedByFocusLoss = true;
                 }
-                pausedByFocusLoss = true;
                 break;
             case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
                 // 临时失去(如来电): 暂停, 结束后恢复
@@ -345,7 +381,7 @@ public class RadioService extends Service
     }
 
     private void resumeInternal() {
-        if (player != null && currentIndex >= 0) {
+        if (player != null && !isPlaying && currentIndex >= 0) {
             try {
                 player.start();
                 isPlaying = true;
@@ -445,6 +481,10 @@ public class RadioService extends Service
     @Override
     public void onDestroy() {
         abandonAudioFocus();
+        if (audioManager != null && playbackCallback != null
+                && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            audioManager.unregisterAudioPlaybackCallback(playbackCallback);
+        }
         if (player != null) { player.release(); player = null; }
         if (mediaSession != null) { mediaSession.release(); mediaSession = null; }
         stopForeground(true);
