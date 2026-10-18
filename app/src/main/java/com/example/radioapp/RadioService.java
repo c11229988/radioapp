@@ -18,6 +18,7 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.util.Log;
+import android.widget.RemoteViews;
 
 import java.util.List;
 
@@ -251,8 +252,9 @@ public class RadioService extends Service
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel ch = new NotificationChannel(
-                    CHANNEL_ID, "网络电台", NotificationManager.IMPORTANCE_LOW);
+                    CHANNEL_ID, "网络电台", NotificationManager.IMPORTANCE_DEFAULT);
             ch.setDescription("网络电台播放通知");
+            ch.setShowBadge(false);
             nm.createNotificationChannel(ch);
         }
 
@@ -268,9 +270,17 @@ public class RadioService extends Service
         PendingIntent togglePi = makeActionIntent(ACTION_TOGGLE, 2);
         PendingIntent nextPi = makeActionIntent(ACTION_NEXT, 3);
 
-        Notification.MediaStyle style = new Notification.MediaStyle();
-        style.setMediaSession(mediaSession.getSessionToken());
-        style.setShowActionsInCompactView(0, 1, 2);
+        RemoteViews views = new RemoteViews(getPackageName(), R.layout.notification_player);
+        views.setTextViewText(R.id.notif_title, title);
+        views.setTextViewText(R.id.notif_text, text);
+        views.setImageViewResource(R.id.notif_icon, R.drawable.ic_radio);
+        views.setImageViewResource(R.id.notif_prev, R.drawable.ic_prev_white);
+        views.setImageViewResource(R.id.notif_next, R.drawable.ic_next_white);
+        views.setImageViewResource(R.id.notif_toggle,
+                isPlaying ? R.drawable.ic_pause_white : R.drawable.ic_play_white);
+        views.setOnClickPendingIntent(R.id.notif_prev, prevPi);
+        views.setOnClickPendingIntent(R.id.notif_toggle, togglePi);
+        views.setOnClickPendingIntent(R.id.notif_next, nextPi);
 
         Notification.Builder builder;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -279,19 +289,19 @@ public class RadioService extends Service
             builder = new Notification.Builder(this);
         }
         builder.setSmallIcon(R.drawable.ic_radio)
-                .setContentTitle(title)
-                .setContentText(text)
                 .setContentIntent(contentIntent)
-                .setStyle(style)
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
                 .setOngoing(true)
                 .setShowWhen(false)
                 .setOnlyAlertOnce(true)
-                .setColor(0xFF6C5CE7)
-                .addAction(R.drawable.ic_prev, "上一台", prevPi)
-                .addAction(isPlaying ? R.drawable.ic_pause : R.drawable.ic_play,
-                        isPlaying ? "暂停" : "播放", togglePi)
-                .addAction(R.drawable.ic_next, "下一台", nextPi);
+                .setColor(0xFF6C5CE7);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            builder.setCustomContentView(views);
+            builder.setCustomBigContentView(views);
+        } else {
+            builder.setContent(views);
+        }
 
         startForeground(NOTIF_ID, builder.build());
     }

@@ -1,13 +1,18 @@
 package com.example.radioapp;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.app.NotificationManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.Settings;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -50,6 +55,8 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+
+        checkNotificationPermission();
 
         listView = findViewById(R.id.station_list);
         nowPlaying = findViewById(R.id.now_playing);
@@ -98,6 +105,14 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        // 从设置页回来或重新打开 App 时, 确保前台服务/通知是活的
+        Intent init = new Intent(this, RadioService.class);
+        init.setAction(RadioService.ACTION_INIT);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(init);
+        } else {
+            startService(init);
+        }
         // 向服务询问当前状态(从通知栏回来时保持界面同步)
         Intent i = new Intent(this, RadioService.class);
         i.setAction(RadioService.ACTION_REQUEST_STATE);
@@ -137,6 +152,50 @@ public class MainActivity extends Activity {
             startForegroundService(i);
         } else {
             startService(i);
+        }
+    }
+
+    private void checkNotificationPermission() {
+        // Android 13+ 需要动态申请 POST_NOTIFICATIONS
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(
+                        new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 100);
+            }
+        }
+
+        // 所有系统版本都要检查通知是否被用户关闭(VIVO/OPPO 等常被系统默认关闭)
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (nm == null || nm.areNotificationsEnabled()) return;
+
+        new AlertDialog.Builder(this)
+                .setTitle("需要通知权限")
+                .setMessage("电台的上一台/播放暂停/下一台按钮要显示在下拉通知栏里，\n\n"
+                        + "请点“去设置”→ 允许通知 → 并开启“后台运行/自启动”，否则退出 APP 后声音会被系统停掉。")
+                .setPositiveButton("去设置", (dialog, which) -> {
+                    Intent i = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
+                    i.putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName());
+                    startActivity(i);
+                })
+                .setNegativeButton("取消", null)
+                .setCancelable(false)
+                .show();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == 100 && grantResults.length > 0
+                && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            // 重新启动服务，让通知显示出来
+            Intent i = new Intent(this, RadioService.class);
+            i.setAction(RadioService.ACTION_INIT);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(i);
+            } else {
+                startService(i);
+            }
         }
     }
 
