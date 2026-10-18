@@ -7,16 +7,20 @@ import android.content.IntentFilter;
 import android.graphics.drawable.Icon;
 import android.os.Build;
 import android.service.quicksettings.Tile;
-import android.service.quicksettings.TileService;
 
 /**
  * 下拉磁贴: 播放 / 暂停 (二合一)
  * - 图标与文字会随播放状态实时变化 (播放中显示"暂停", 暂停时显示"播放")
  * - 拉下状态栏时主动询问一次当前状态, 并监听 RadioService 的状态广播
  */
-public class RadioPlayTile extends TileService {
+public class RadioPlayTile extends BaseRadioTile {
 
     private boolean isPlaying = false;
+
+    @Override
+    protected String getAction() {
+        return RadioService.ACTION_TOGGLE;
+    }
 
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
         @Override
@@ -37,7 +41,7 @@ public class RadioPlayTile extends TileService {
             registerReceiver(stateReceiver, f);
         }
         // 主动询问一次当前状态, 避免磁贴图标与实际状态不一致
-        startService(new Intent(this, RadioService.class)
+        startRadioService(new Intent(this, RadioService.class)
                 .setAction(RadioService.ACTION_REQUEST_STATE));
     }
 
@@ -48,14 +52,6 @@ public class RadioPlayTile extends TileService {
         } catch (Exception ignore) {
         }
         super.onStopListening();
-    }
-
-    @Override
-    public void onClick() {
-        super.onClick();
-        Intent i = new Intent(this, RadioService.class);
-        i.setAction(RadioService.ACTION_TOGGLE);
-        startRadioService(i);
     }
 
     private void refreshTile() {
