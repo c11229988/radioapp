@@ -1,0 +1,35 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 中心圆: 电台核心 -->
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M54,47m-7,0a7,7 0 1,1 14,0a7,7 0 1,1 -14,0"/>
+    <!-- 左侧内弧 -->
+    <path android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:pathData="M41,46a13,13 0 0,0 0,16"/>
+    <!-- 右侧内弧 -->
+    <path android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:pathData="M67,46a13,13 0 0,1 0,16"/>
+    <!-- 左侧外弧 -->
+    <path android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeAlpha="0.55"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:pathData="M33,41a23,23 0 0,0 0,26"/>
+    <!-- 右侧外弧 -->
+    <path android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeAlpha="0.55"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:pathData="M75,41a23,23 0 0,1 0,26"/>
+</vector>
