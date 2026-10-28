@@ -25,6 +25,4 @@ android {
 }
 
 dependencies {
-    // 播放内核: ExoPlayer(Media3), 支持自定义缓冲窗口
-    implementation 'androidx.media3:media3-exoplayer:1.4.1'
 }
