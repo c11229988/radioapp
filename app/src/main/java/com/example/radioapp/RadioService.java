@@ -8,40 +8,42 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.media.AudioAttributes;
-import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.AudioPlaybackConfiguration;
 import android.media.MediaMetadata;
-import android.media.MediaPlayer;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
-import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
-import android.os.PowerManager;
 import android.util.Log;
 import android.widget.RemoteViews;
+
+import androidx.media3.common.C;
+import androidx.media3.common.MediaItem;
+import androidx.media3.common.PlaybackException;
+import androidx.media3.common.Player;
+import androidx.media3.exoplayer.DefaultLoadControl;
+import androidx.media3.exoplayer.ExoPlayer;
 
 import java.util.List;
 
 /**
- * 后台播放服务:
- * - 用 MediaPlayer 播放网络电台流
- * - 用 MediaSession + 前台通知实现"通知栏/锁屏"的上一台/暂停/下一台控制
- * - 通过广播把当前播放状态发给主界面(更新底部控制栏)
+ * 后台播放服务(播放内核: ExoPlayer / Media3):
+ * - ExoPlayer 支持自定义缓冲窗口, 解决 MediaPlayer 开局"播几秒卡一下"的问题
+ * - 音频焦点由 ExoPlayer 托管(handleAudioFocus=true): 别的 App 播放时自动让位, 结束后自动恢复
+ * - 用 MediaSession + 前台通知实现通知栏/锁屏的上一台/暂停/下一台控制
+ * - 通过广播把播放状态发给主界面
  *
  * 主界面通过 startService(带 action) 下发指令:
  *   PLAY / TOGGLE / NEXT / PREV / STOP / REQUEST_STATE
  */
-public class RadioService extends Service
-        implements MediaPlayer.OnPreparedListener, MediaPlayer.OnErrorListener,
-                MediaPlayer.OnInfoListener, MediaPlayer.OnBufferingUpdateListener {
+public class RadioService extends Service {
 
     public static final String ACTION_PLAY = "com.example.radioapp.action.PLAY";
     public static final String ACTION_TOGGLE = "com.example.radioapp.action.TOGGLE";
@@ -57,24 +59,22 @@ public class RadioService extends Service
 
     private static final int NOTIF_ID = 1;
     private static final String CHANNEL_ID = "radio_channel";
+    private static final int MAX_RETRY = 4;
 
-    private MediaPlayer player;
+    private ExoPlayer player;
     private MediaSession mediaSession;
     private AudioManager audioManager;
-    private AudioManager.OnAudioFocusChangeListener audioFocusListener;
     private AudioManager.AudioPlaybackCallback playbackCallback;
-    private Object audioFocusRequest; // AudioFocusRequest (API 26+)
-    private Handler mainHandler;
-    private boolean pausedByFocusLoss = false; // 是否因被其他应用抢走声音而暂停
-    private boolean userWantsPlay = false;     // 用户是否"想听"(用于断网恢复后自动续播)
-    private WifiManager.WifiLock wifiLock;     // 防止息屏后 Wi-Fi 休眠导致缓冲中断
     private ConnectivityManager connectivityManager;
     private ConnectivityManager.NetworkCallback networkCallback;
+    private Handler mainHandler;
+
     private int currentIndex = -1;
     private boolean isPlaying = false;
     private boolean isBuffering = false;
     private int retryCount = 0;
-    private static final int MAX_RETRY = 4;
+    private boolean pausedByFocusLoss = false; // 是否因被其他应用抢走声音而暂停
+    private boolean userWantsPlay = false;     // 用户是否"想听"(断网恢复后据此自动续播)
 
     private final MediaSession.Callback sessionCallback = new MediaSession.Callback() {
         @Override
@@ -93,6 +93,41 @@ public class RadioService extends Service
         public void onStop() { stop(); }
     };
 
+    private final Player.Listener playerListener = new Player.Listener() {
+        @Override
+        public void onIsPlayingChanged(boolean playing) {
+            isPlaying = playing;
+            updatePlaybackState(playing ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED);
+            updateNotification();
+            broadcastState();
+        }
+
+        @Override
+        public void onPlaybackStateChanged(int playbackState) {
+            if (playbackState == Player.STATE_BUFFERING) {
+                isBuffering = true;
+                updateNotification();
+            } else if (playbackState == Player.STATE_READY) {
+                isBuffering = false;
+                retryCount = 0;
+                updateNotification();
+            } else if (playbackState == Player.STATE_ENDED) {
+                // 直播流一般不到这里; 若服务端主动断开则重连
+                if (userWantsPlay && currentIndex >= 0) play(currentIndex);
+            }
+        }
+
+        @Override
+        public void onPlayerError(PlaybackException error) {
+            Log.e("RadioService", "ExoPlayer error: " + error.getErrorCodeName());
+            isPlaying = false;
+            isBuffering = false;
+            updateNotification();
+            broadcastState();
+            scheduleReconnect();
+        }
+    };
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -102,18 +137,11 @@ public class RadioService extends Service
         mediaSession.setCallback(sessionCallback);
         mediaSession.setActive(true);
 
-        // 音频焦点: 其他应用(音乐/视频/导航)开始时让出声音, 结束后恢复
         audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
         mainHandler = new Handler(Looper.getMainLooper());
-        audioFocusListener = new AudioManager.OnAudioFocusChangeListener() {
-            @Override
-            public void onAudioFocusChange(int focusChange) {
-                handleAudioFocusChange(focusChange);
-            }
-        };
 
         // 兜底: 部分国产 ROM 在别的媒体停止后不会回调 AUDIOFOCUS_GAIN,
-        // 这里直接监听系统里是否还有其它媒体在播, 没有了就自动续播(API 29+)
+        // 这里直接监听系统里是否还有别的媒体在播, 没有了就自动续播(API 29+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             playbackCallback = new AudioManager.AudioPlaybackCallback() {
                 @Override
@@ -127,7 +155,6 @@ public class RadioService extends Service
                         }
                     }
                     if (!otherMediaActive) {
-                        // 其它媒体都停了, 主线程恢复播放
                         mainHandler.post(new Runnable() {
                             @Override
                             public void run() { resumeInternal(); }
@@ -138,7 +165,7 @@ public class RadioService extends Service
             audioManager.registerAudioPlaybackCallback(playbackCallback, null);
         }
 
-        // 网络恢复监听: 断网/弱网导致停播后, 网络一恢复就自动续播(不必等到重试耗尽)
+        // 网络恢复监听: 断网/弱网停播后, 网络一恢复就自动续播
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
             NetworkRequest request = new NetworkRequest.Builder()
@@ -176,7 +203,6 @@ public class RadioService extends Service
         } else if (ACTION_STOP.equals(action)) {
             stop();
         } else if (ACTION_INIT.equals(action)) {
-            // 打开 App 时让通知栏立刻出现控制按钮(即使还没选台)
             updateNotification();
         } else if (ACTION_REQUEST_STATE.equals(action)) {
             broadcastState();
@@ -184,46 +210,32 @@ public class RadioService extends Service
         return START_STICKY;
     }
 
+    /**
+     * 创建 ExoPlayer: 关键在缓冲窗口可调(MediaPlayer 做不到)。
+     * - 最小缓冲 15 秒 / 最大 30 秒: 网络抖动时仍有充足余量, 不会一卡就断
+     * - 起播前先攒 2.5 秒: 避免"点开播几秒就停一下"
+     * - 卡顿后重新起播需攒 5 秒: 恢复后更稳
+     * - WAKE_MODE_NETWORK: 息屏保持 Wi-Fi 与 CPU 唤醒, 防缓冲中断
+     */
     private void ensurePlayer() {
         if (player == null) {
-            player = new MediaPlayer();
-            player.setWakeMode(getApplicationContext(), PowerManager.PARTIAL_WAKE_LOCK);
-            AudioAttributes attrs = new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+            DefaultLoadControl loadControl = new DefaultLoadControl.Builder()
+                    .setBufferDurationsMs(15000, 30000, 2500, 5000)
+                    .setPrioritizeTimeOverSizeThresholds(true)
                     .build();
-            player.setAudioAttributes(attrs);
-            player.setOnPreparedListener(this);
-            player.setOnErrorListener(this);
-            player.setOnInfoListener(this);
-            player.setOnBufferingUpdateListener(this);
-        }
-    }
-
-    /**
-     * 申请 Wi-Fi 高性能锁: 息屏后系统会限制 Wi-Fi 省电, 导致直播流缓冲中断而卡顿/断流。
-     * 这是网络电台"播几秒就停、听着听着卡住"最常见的元凶。
-     */
-    private void acquireWifiLock() {
-        if (wifiLock == null) {
-            WifiManager wm = (WifiManager) getApplicationContext()
-                    .getSystemService(Context.WIFI_SERVICE);
-            if (wm != null) {
-                int mode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
-                        ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-                        : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
-                wifiLock = wm.createWifiLock(mode, "RadioApp:stream");
-                wifiLock.setReferenceCounted(false);
-            }
-        }
-        if (wifiLock != null && !wifiLock.isHeld()) {
-            wifiLock.acquire();
-        }
-    }
-
-    private void releaseWifiLock() {
-        if (wifiLock != null && wifiLock.isHeld()) {
-            wifiLock.release();
+            player = new ExoPlayer.Builder(this)
+                    .setLoadControl(loadControl)
+                    .build();
+            androidx.media3.common.AudioAttributes attrs =
+                    new androidx.media3.common.AudioAttributes.Builder()
+                            .setUsage(C.USAGE_MEDIA)
+                            .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                            .build();
+            // 第二个参数 true: 由 ExoPlayer 自动处理音频焦点(别的 App 播放时让位, 结束后恢复)
+            player.setAudioAttributes(attrs, true);
+            player.setHandleAudioBecomingNoisy(true);
+            player.setWakeMode(C.WAKE_MODE_NETWORK);
+            player.addListener(playerListener);
         }
     }
 
@@ -238,79 +250,36 @@ public class RadioService extends Service
         currentIndex = idx;
         Station s = list.get(idx);
         ensurePlayer();
-        acquireWifiLock();
         try {
-            player.reset();
-            player.setDataSource(s.url);
-            player.prepareAsync();
+            player.setMediaItem(MediaItem.fromUri(s.url));
+            player.prepare();
+            player.play();
             updatePlaybackState(PlaybackState.STATE_CONNECTING);
             updateNotification();
         } catch (Exception e) {
-            Log.e("RadioService", "setDataSource failed", e);
+            Log.e("RadioService", "play failed", e);
         }
     }
 
-    @Override
-    public void onPrepared(MediaPlayer mp) {
-        retryCount = 0;
-        requestAudioFocus();
-        mp.start();
-        isPlaying = true;
-        pausedByFocusLoss = false;
-        isBuffering = false;
-        updatePlaybackState(PlaybackState.STATE_PLAYING);
-        updateNotification();
-        broadcastState();
-    }
-
-    @Override
-    public boolean onError(MediaPlayer mp, int what, int extra) {
-        Log.e("RadioService", "MediaPlayer error what=" + what + " extra=" + extra);
-        isPlaying = false;
-        isBuffering = false;
-        updatePlaybackState(PlaybackState.STATE_ERROR);
-        updateNotification();
-        broadcastState();
-        // 网络抖动导致断流: 自动重连当前电台(退避重试, 避免弱网时疯狂重连)
-        if (currentIndex >= 0 && retryCount < MAX_RETRY) {
-            retryCount++;
-            long delay;
-            switch (retryCount) {
-                case 1: delay = 800; break;
-                case 2: delay = 1500; break;
-                case 3: delay = 3000; break;
-                default: delay = 5000; break;
+    /** 断流后按退避策略重连: 800ms → 1.5s → 3s → 5s */
+    private void scheduleReconnect() {
+        if (currentIndex < 0 || retryCount >= MAX_RETRY || !userWantsPlay) return;
+        retryCount++;
+        long delay;
+        switch (retryCount) {
+            case 1: delay = 800; break;
+            case 2: delay = 1500; break;
+            case 3: delay = 3000; break;
+            default: delay = 5000; break;
+        }
+        final int idx = currentIndex;
+        Log.e("RadioService", "网络抖动, " + delay + "ms 后自动重连第 " + retryCount + " 次");
+        mainHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (currentIndex == idx && userWantsPlay) play(idx);
             }
-            Log.e("RadioService", "网络抖动, " + delay + "ms 后自动重连第 " + retryCount + " 次");
-            final int idx = currentIndex;
-            new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    if (currentIndex == idx && userWantsPlay) play(idx);
-                }
-            }, delay);
-        }
-        return true;
-    }
-
-    @Override
-    public boolean onInfo(MediaPlayer mp, int what, int extra) {
-        // 直播流网络波动时 MediaPlayer 会进入缓冲: 提示用户而非表现为"卡死"
-        if (what == MediaPlayer.MEDIA_INFO_BUFFERING_START) {
-            isBuffering = true;
-            updatePlaybackState(PlaybackState.STATE_BUFFERING);
-            updateNotification();
-        } else if (what == MediaPlayer.MEDIA_INFO_BUFFERING_END) {
-            isBuffering = false;
-            updatePlaybackState(PlaybackState.STATE_PLAYING);
-            updateNotification();
-        }
-        return false;
-    }
-
-    @Override
-    public void onBufferingUpdate(MediaPlayer mp, int percent) {
-        // 预留: 可用于显示缓冲进度
+        }, delay);
     }
 
     private void toggle() {
@@ -318,20 +287,12 @@ public class RadioService extends Service
         if (player == null) { play(currentIndex); return; }
         if (player.isPlaying()) {
             player.pause();
-            isPlaying = false;
             userWantsPlay = false;
-            updatePlaybackState(PlaybackState.STATE_PAUSED);
         } else {
-            requestAudioFocus();
-            acquireWifiLock();
-            player.start();
-            isPlaying = true;
+            player.play();
             userWantsPlay = true;
             pausedByFocusLoss = false;
-            updatePlaybackState(PlaybackState.STATE_PLAYING);
         }
-        updateNotification();
-        broadcastState();
     }
 
     private void next() {
@@ -345,15 +306,41 @@ public class RadioService extends Service
     }
 
     private void stop() {
-        abandonAudioFocus();
-        releaseWifiLock();
-        if (player != null) { player.stop(); player.reset(); }
+        if (player != null) { player.stop(); }
         isPlaying = false;
+        isBuffering = false;
         pausedByFocusLoss = false;
         userWantsPlay = false;
         updatePlaybackState(PlaybackState.STATE_STOPPED);
         stopForeground(true);
         broadcastState();
+    }
+
+    private void resumeInternal() {
+        if (player != null && !isPlaying && userWantsPlay && currentIndex >= 0) {
+            pausedByFocusLoss = false;
+            player.play();
+        }
+    }
+
+    /**
+     * 判断某个播放配置是否为"其它应用正在播放的媒体"。
+     * 部分编译环境的 android.jar 未暴露 AudioPlaybackConfiguration 的实例方法,
+     * 直接写 c.isActive() 会编译失败, 故改为反射调用(真机上是公开 API)。
+     */
+    private static boolean isOtherMediaActive(AudioPlaybackConfiguration c) {
+        try {
+            Object active = c.getClass().getMethod("isActive").invoke(c);
+            if (!(active instanceof Boolean) || !((Boolean) active)) return false;
+            Object attrs = c.getClass().getMethod("getAudioAttributes").invoke(c);
+            if (attrs instanceof AudioAttributes) {
+                int usage = ((AudioAttributes) attrs).getUsage();
+                return usage == AudioAttributes.USAGE_MEDIA || usage == AudioAttributes.USAGE_GAME;
+            }
+        } catch (Throwable t) {
+            return true; // 取不到就保守认为还有别的媒体在播, 避免误恢复
+        }
+        return false;
     }
 
     private void updatePlaybackState(int state) {
@@ -373,116 +360,6 @@ public class RadioService extends Service
         mediaSession.setMetadata(m.build());
     }
 
-    // ===== 音频焦点管理: 避免与其他音乐/视频/导航应用抢声音 =====
-
-    private void requestAudioFocus() {
-        if (audioManager == null) return;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            if (audioFocusRequest == null) {
-                AudioAttributes attrs = new AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .build();
-                audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                        .setAudioAttributes(attrs)
-                        .setOnAudioFocusChangeListener(audioFocusListener)
-                        .build();
-            }
-            audioManager.requestAudioFocus((AudioFocusRequest) audioFocusRequest);
-        } else {
-            audioManager.requestAudioFocus(audioFocusListener,
-                    AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
-        }
-    }
-
-    private void abandonAudioFocus() {
-        if (audioManager == null) return;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            if (audioFocusRequest != null) {
-                audioManager.abandonAudioFocusRequest((AudioFocusRequest) audioFocusRequest);
-            }
-        } else {
-            audioManager.abandonAudioFocus(audioFocusListener);
-        }
-    }
-
-    private void handleAudioFocusChange(int focusChange) {
-        switch (focusChange) {
-            case AudioManager.AUDIOFOCUS_LOSS:
-                // 被其他应用长期占用(如音乐 App 开始播放): 暂停, 等对方停止后自动恢复
-                if (isPlaying) {
-                    pauseInternal();
-                    pausedByFocusLoss = true;
-                }
-                break;
-            case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
-                // 临时失去(如来电): 暂停, 结束后恢复
-                if (isPlaying) {
-                    pauseInternal();
-                    pausedByFocusLoss = true;
-                }
-                break;
-            case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
-                // 短暂压低音量即可(如导航提示音), 不必暂停
-                if (player != null) player.setVolume(0.15f, 0.15f);
-                break;
-            case AudioManager.AUDIOFOCUS_GAIN:
-                // 重新获得焦点: 恢复正常音量; 若之前因被抢而暂停, 则自动恢复播放
-                if (player != null) player.setVolume(1.0f, 1.0f);
-                if (pausedByFocusLoss && !isPlaying && currentIndex >= 0) {
-                    resumeInternal();
-                }
-                pausedByFocusLoss = false;
-                break;
-        }
-    }
-
-    private void pauseInternal() {
-        if (player != null && player.isPlaying()) {
-            player.pause();
-            isPlaying = false;
-            updatePlaybackState(PlaybackState.STATE_PAUSED);
-            updateNotification();
-            broadcastState();
-        }
-    }
-
-    private void resumeInternal() {
-        if (player != null && !isPlaying && currentIndex >= 0) {
-            try {
-                player.start();
-                isPlaying = true;
-                updatePlaybackState(PlaybackState.STATE_PLAYING);
-                updateNotification();
-                broadcastState();
-            } catch (Exception e) {
-                // start 失败(如流已断开)则重新连接当前台
-                play(currentIndex);
-            }
-        }
-    }
-
-    /**
-     * 判断某个播放配置是否为"其它应用正在播放的媒体"。
-     * 说明: 部分编译环境的 android.jar 没有暴露 AudioPlaybackConfiguration 的实例方法,
-     * 直接写 c.isActive() / getAudioAttributes() 会编译失败, 故改为反射调用(真机上是公开 API)。
-     */
-    private static boolean isOtherMediaActive(AudioPlaybackConfiguration c) {
-        try {
-            Object active = c.getClass().getMethod("isActive").invoke(c);
-            if (!(active instanceof Boolean) || !((Boolean) active)) return false;
-            Object attrs = c.getClass().getMethod("getAudioAttributes").invoke(c);
-            if (attrs instanceof AudioAttributes) {
-                int usage = ((AudioAttributes) attrs).getUsage();
-                return usage == AudioAttributes.USAGE_MEDIA || usage == AudioAttributes.USAGE_GAME;
-            }
-        } catch (Throwable t) {
-            // 取不到就保守认为还有别的媒体在播, 避免误恢复打扰用户
-            return true;
-        }
-        return false;
-    }
-
     private void updateNotification() {
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -496,7 +373,7 @@ public class RadioService extends Service
 
         String title = currentIndex >= 0 ? Stations.list.get(currentIndex).name : "网络电台";
         String text = currentIndex >= 0
-                ? (isBuffering ? "缓冲中…" : "正在播放")
+                ? (isBuffering ? "缓冲中…" : (isPlaying ? "正在播放" : "已暂停"))
                 : "点击播放开始收听";
 
         Intent openIntent = new Intent(this, MainActivity.class);
@@ -568,8 +445,6 @@ public class RadioService extends Service
 
     @Override
     public void onDestroy() {
-        abandonAudioFocus();
-        releaseWifiLock();
         if (connectivityManager != null && networkCallback != null
                 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             connectivityManager.unregisterNetworkCallback(networkCallback);
@@ -578,7 +453,11 @@ public class RadioService extends Service
                 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             audioManager.unregisterAudioPlaybackCallback(playbackCallback);
         }
-        if (player != null) { player.release(); player = null; }
+        if (player != null) {
+            player.removeListener(playerListener);
+            player.release();
+            player = null;
+        }
         if (mediaSession != null) { mediaSession.release(); mediaSession = null; }
         stopForeground(true);
         super.onDestroy();
