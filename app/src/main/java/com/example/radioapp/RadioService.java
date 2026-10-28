@@ -15,6 +15,11 @@ import android.media.MediaMetadata;
 import android.media.MediaPlayer;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -61,6 +66,10 @@ public class RadioService extends Service
     private Object audioFocusRequest; // AudioFocusRequest (API 26+)
     private Handler mainHandler;
     private boolean pausedByFocusLoss = false; // 是否因被其他应用抢走声音而暂停
+    private boolean userWantsPlay = false;     // 用户是否"想听"(用于断网恢复后自动续播)
+    private WifiManager.WifiLock wifiLock;     // 防止息屏后 Wi-Fi 休眠导致缓冲中断
+    private ConnectivityManager connectivityManager;
+    private ConnectivityManager.NetworkCallback networkCallback;
     private int currentIndex = -1;
     private boolean isPlaying = false;
     private boolean isBuffering = false;
@@ -112,8 +121,7 @@ public class RadioService extends Service
                     if (!pausedByFocusLoss || isPlaying) return;
                     boolean otherMediaActive = false;
                     for (AudioPlaybackConfiguration c : configs) {
-                        if (c.isActive()
-                                && c.getAudioAttributes().getUsage() == AudioAttributes.USAGE_MEDIA) {
+                        if (isOtherMediaActive(c)) {
                             otherMediaActive = true;
                             break;
                         }
@@ -128,6 +136,29 @@ public class RadioService extends Service
                 }
             };
             audioManager.registerAudioPlaybackCallback(playbackCallback, null);
+        }
+
+        // 网络恢复监听: 断网/弱网导致停播后, 网络一恢复就自动续播(不必等到重试耗尽)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            NetworkRequest request = new NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .build();
+            networkCallback = new ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onAvailable(Network network) {
+                    mainHandler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (userWantsPlay && currentIndex >= 0 && !isPlaying) {
+                                retryCount = 0;
+                                play(currentIndex);
+                            }
+                        }
+                    });
+                }
+            };
+            connectivityManager.registerNetworkCallback(request, networkCallback);
         }
     }
 
@@ -169,16 +200,45 @@ public class RadioService extends Service
         }
     }
 
+    /**
+     * 申请 Wi-Fi 高性能锁: 息屏后系统会限制 Wi-Fi 省电, 导致直播流缓冲中断而卡顿/断流。
+     * 这是网络电台"播几秒就停、听着听着卡住"最常见的元凶。
+     */
+    private void acquireWifiLock() {
+        if (wifiLock == null) {
+            WifiManager wm = (WifiManager) getApplicationContext()
+                    .getSystemService(Context.WIFI_SERVICE);
+            if (wm != null) {
+                int mode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                        ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                        : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                wifiLock = wm.createWifiLock(mode, "RadioApp:stream");
+                wifiLock.setReferenceCounted(false);
+            }
+        }
+        if (wifiLock != null && !wifiLock.isHeld()) {
+            wifiLock.acquire();
+        }
+    }
+
+    private void releaseWifiLock() {
+        if (wifiLock != null && wifiLock.isHeld()) {
+            wifiLock.release();
+        }
+    }
+
     private void play(int index) {
         retryCount = 0;
         isBuffering = false;
         pausedByFocusLoss = false;
+        userWantsPlay = true;
         List<Station> list = Stations.list;
         if (list.isEmpty()) return;
         int idx = Math.max(0, Math.min(index, list.size() - 1));
         currentIndex = idx;
         Station s = list.get(idx);
         ensurePlayer();
+        acquireWifiLock();
         try {
             player.reset();
             player.setDataSource(s.url);
@@ -211,17 +271,24 @@ public class RadioService extends Service
         updatePlaybackState(PlaybackState.STATE_ERROR);
         updateNotification();
         broadcastState();
-        // 网络抖动导致断流: 自动重连当前电台(限制次数, 避免死循环)
+        // 网络抖动导致断流: 自动重连当前电台(退避重试, 避免弱网时疯狂重连)
         if (currentIndex >= 0 && retryCount < MAX_RETRY) {
             retryCount++;
-            Log.e("RadioService", "网络抖动, 自动重连第 " + retryCount + " 次");
+            long delay;
+            switch (retryCount) {
+                case 1: delay = 800; break;
+                case 2: delay = 1500; break;
+                case 3: delay = 3000; break;
+                default: delay = 5000; break;
+            }
+            Log.e("RadioService", "网络抖动, " + delay + "ms 后自动重连第 " + retryCount + " 次");
             final int idx = currentIndex;
             new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
                 @Override
                 public void run() {
-                    if (currentIndex == idx) play(idx);
+                    if (currentIndex == idx && userWantsPlay) play(idx);
                 }
-            }, 1500);
+            }, delay);
         }
         return true;
     }
@@ -252,11 +319,14 @@ public class RadioService extends Service
         if (player.isPlaying()) {
             player.pause();
             isPlaying = false;
+            userWantsPlay = false;
             updatePlaybackState(PlaybackState.STATE_PAUSED);
         } else {
             requestAudioFocus();
+            acquireWifiLock();
             player.start();
             isPlaying = true;
+            userWantsPlay = true;
             pausedByFocusLoss = false;
             updatePlaybackState(PlaybackState.STATE_PLAYING);
         }
@@ -276,9 +346,11 @@ public class RadioService extends Service
 
     private void stop() {
         abandonAudioFocus();
+        releaseWifiLock();
         if (player != null) { player.stop(); player.reset(); }
         isPlaying = false;
         pausedByFocusLoss = false;
+        userWantsPlay = false;
         updatePlaybackState(PlaybackState.STATE_STOPPED);
         stopForeground(true);
         broadcastState();
@@ -390,6 +462,27 @@ public class RadioService extends Service
         }
     }
 
+    /**
+     * 判断某个播放配置是否为"其它应用正在播放的媒体"。
+     * 说明: 部分编译环境的 android.jar 没有暴露 AudioPlaybackConfiguration 的实例方法,
+     * 直接写 c.isActive() / getAudioAttributes() 会编译失败, 故改为反射调用(真机上是公开 API)。
+     */
+    private static boolean isOtherMediaActive(AudioPlaybackConfiguration c) {
+        try {
+            Object active = c.getClass().getMethod("isActive").invoke(c);
+            if (!(active instanceof Boolean) || !((Boolean) active)) return false;
+            Object attrs = c.getClass().getMethod("getAudioAttributes").invoke(c);
+            if (attrs instanceof AudioAttributes) {
+                int usage = ((AudioAttributes) attrs).getUsage();
+                return usage == AudioAttributes.USAGE_MEDIA || usage == AudioAttributes.USAGE_GAME;
+            }
+        } catch (Throwable t) {
+            // 取不到就保守认为还有别的媒体在播, 避免误恢复打扰用户
+            return true;
+        }
+        return false;
+    }
+
     private void updateNotification() {
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -476,6 +569,11 @@ public class RadioService extends Service
     @Override
     public void onDestroy() {
         abandonAudioFocus();
+        releaseWifiLock();
+        if (connectivityManager != null && networkCallback != null
+                && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            connectivityManager.unregisterNetworkCallback(networkCallback);
+        }
         if (audioManager != null && playbackCallback != null
                 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             audioManager.unregisterAudioPlaybackCallback(playbackCallback);
